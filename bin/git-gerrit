@@ -39,11 +39,47 @@ if [[ -z "$SSH" ]]; then
     die "ssh is not installed"
 fi
 
+FGREP=$(which fgrep)
+if [[ -z "$FGREP" ]]; then
+    die "fgrep is not installed"
+fi
+
 GERRIT_CHERRY_PICK=$(which gerrit-cherry-pick)
 
 if [[ -z "$GERRIT_CHERRY_PICK" ]]; then
     die "gerrit-cherry-pick is not installed"
 fi
+
+_git() {
+    if [[ "$verbose" = true ]]; then
+        echo -e "+ ${GREEN}${GIT} $@${NO_COLOR}"
+    fi
+
+    if [[ "$run" = true ]]; then
+        $GIT $@ 2>&1 | tee /dev/tty > $GIT_OUTPUT_FILE
+        return ${PIPESTATUS[0]}
+    fi
+}
+_gerrit_cherry_pick() {
+    if [[ "$verbose" = true ]]; then
+        echo -e "+ ${GREEN}${GERRIT_CHERRY_PICK} $@${NO_COLOR}"
+    fi
+
+    if [[ "$run" = true ]]; then
+        $GERRIT_CHERRY_PICK $@ 2>&1 | tee /dev/tty > $GIT_OUTPUT_FILE
+        return ${PIPESTATUS[0]}
+    fi
+}
+_ssh() {
+    if [[ "$verbose" = true ]]; then
+        echo -e "+ ${GREEN}${SSH} $@${NO_COLOR}"
+    fi
+
+    if [[ "$run" = true ]]; then
+        $SSH $@ 2>&1 | tee /dev/tty > $GIT_OUTPUT_FILE
+        return ${PIPESTATUS[0]}
+    fi
+}
 
 # creates a new unique output file by using the current process ID
 GIT_OUTPUT_FILE="/tmp/git_output$$"
@@ -57,36 +93,6 @@ fi
 CURRENT=$($GIT symbolic-ref -q HEAD || $GIT rev-parse HEAD)
 CURRENT=${CURRENT#refs/heads/}
 
-git() {
-    if [[ "$verbose" = true ]]; then
-        echo -e "+ ${GREEN}git $@${NO_COLOR}"
-    fi
-
-    if [[ "$run" = true ]]; then
-        $GIT $@ 2>&1 | tee /dev/tty > $GIT_OUTPUT_FILE
-        return ${PIPESTATUS[0]}
-    fi
-}
-gerrit-cherry-pick() {
-    if [[ "$verbose" = true ]]; then
-        echo -e "+ ${GREEN}gerrit-cherry-pick $@${NO_COLOR}"
-    fi
-
-    if [[ "$run" = true ]]; then
-        $GERRIT_CHERRY_PICK $@ 2>&1 | tee /dev/tty > $GIT_OUTPUT_FILE
-        return ${PIPESTATUS[0]}
-    fi
-}
-ssh() {
-    if [[ "$verbose" = true ]]; then
-        echo -e "+ ${GREEN}ssh $@${NO_COLOR}"
-    fi
-
-    if [[ "$run" = true ]]; then
-        $SSH $@ 2>&1 | tee /dev/tty > $GIT_OUTPUT_FILE
-        return ${PIPESTATUS[0]}
-    fi
-}
 
 trap _cleanup_git_output EXIT
 
@@ -97,9 +103,9 @@ _cleanup_git_output() {
 no_changes () {
     # $GIT diff-index --quiet --cached HEAD -- &&
     #     $GIT diff-files --quiet
-    $GIT update-index --refresh --unmerged -q >/dev/null
-    $GIT diff-index --quiet --cached HEAD -- &&
-        $GIT diff-files --quiet
+    _git update-index --refresh --unmerged -q >/dev/null
+    _git diff-index --quiet --cached HEAD -- &&
+        _git diff-files --quiet
 }
 
 is_integer() {
@@ -109,7 +115,7 @@ is_integer() {
 
 has_remote_branch() {
     local remote=$1 branch=$2
-    $GIT branch -r | grep "$remote/$branch" > /dev/null
+    _git branch -r | grep "$remote/$branch" > /dev/null
     return $?
 }
 
@@ -217,17 +223,19 @@ getGerritServerAndProject() {
       port=""
     fi
 
+
     project=${project%.git}
 
     port=${port%/*}
-    if [[ ! -z "$port" ]]; then
-      port="-p $port"
+    if [[ -z "$port" ]]; then
+      port="ssh"
     fi
+    echo "debug: host=$host ; port=$port, project=$project"
 }
 
 executeGerritCommand() {
     getGerritServerAndProject
-    gerrit_command_result=$($SSH $port $host gerrit $@)
+    gerrit_command_result=$($SSH -p $port $host gerrit $@)
 }
 
 getBranchInfo() {
@@ -245,7 +253,7 @@ getBranchInfo() {
     fi
 
     if [[ -e "$GERRIT_TRACK" ]]; then
-        local data=($(fgrep "$CURRENT:" "$GERRIT_TRACK" | awk -F: '{print $2" "$3" "$4" "$5}'))
+        local data=($($FGREP "$CURRENT:" "$GERRIT_TRACK" | awk -F: '{print $2" "$3" "$4" "$5}'))
         if [[ -n "${data[0]}" ]] ; then
             FROM_BRANCH=${data[0]}
             REMOTE=${data[1]}
@@ -273,7 +281,7 @@ applyChange() {
         if has_remote_branch $remote $current ; then
             track="$current"
         else
-            local msg="Your may forget set upstream branch for branch ${GREEN}$current${RED}."
+            local msg="You may forget to set upstream branch for branch ${GREEN}$current${RED}."
             local msg="${msg}\nSince the changes ${GREEN}$change${RED} must be applied on proper remote branch."
             local msg="${msg}\nType the following command to set:"
             local msg="${msg}\n${GREEN}git branch --set-upstream $current${RED} [upstream]."
@@ -284,8 +292,8 @@ applyChange() {
     local track_branch="$remote/$track"
 
     # create a new branch based on the current tracking branch to work in
-    $GIT branch -D $branch 2>/dev/null 1>&2
-    git checkout -b $branch $track_branch ||
+    _git branch -D $branch 2>/dev/null 1>&2
+    _git checkout -b $branch $track_branch ||
         die "Unable to create a new branch '$branch'"
 
     # track original branch.
@@ -293,6 +301,7 @@ applyChange() {
 
     # apply the change to the new branch
     local patch="$(patch_count_for_change $change)"
+    echo "debug: gerrit-cherry-pick $remote $change/$patch"
     gerrit-cherry-pick $remote $change/$patch ||
         die "Unable to apply ±$change/$patch on top of $track_branch"
 
@@ -304,7 +313,7 @@ applyChange() {
 # git gerrit reset
 resetChange() {
     if [[ "$1" == "-f" ]]; then
-        git reset --hard
+        _git reset --hard
     else
         abort_on_bad_repo_state
     fi
@@ -319,7 +328,7 @@ resetChange() {
     remove_track "$current"
 
     if [[ ${CURRENT:0:1} == "r" ]] && is_integer ${CURRENT:1}; then
-        git checkout $from_branch && git branch -D $current ||
+        _git checkout $from_branch && _git branch -D $current ||
             die "Unable to close the review branch $current"
     else
         die "We are not on a review branch ($current)"
@@ -366,9 +375,9 @@ showPatchSetDiff() {
 
     local args="diff $params $track_branch..$commit"
     if [[ "$verbose" = true ]]; then
-        echo -e "+ ${GREEN}git $args${NO_COLOR}"
+        echo -e "+ ${GREEN}$GIT $args${NO_COLOR}"
     fi
-    $GIT $args
+    _git $args
 }
 
 diffPatches() {
@@ -417,26 +426,26 @@ diffPatches() {
     local branch2="r$change,$patch2"
 
     # create a branch for patch1
-    git checkout -b $branch1 $track_branch >/dev/null 2>&1 ||
+    _git checkout -b $branch1 $track_branch >/dev/null 2>&1 ||
         die "Unable to create a new branch '$branch1'"
     gerrit-cherry-pick $remote $change/$patch1 >/dev/null 2>&1 ||
         die "Unable to apply ±$branch1 on top of $track_branch"
 
     # create a branch for patch2
-    git checkout -b $branch2 $track_branch >/dev/null 2>&1 ||
+    _git checkout -b $branch2 $track_branch >/dev/null 2>&1 ||
         die "Unable to create a new branch '$branch2'"
     gerrit-cherry-pick $remote $change/$patch2 >/dev/null 2>&1 ||
         die "Unable to apply ±$branch2 on top of $track_branch"
 
     # actually show the diff
-    git diff --src-prefix=$branch1: --dst-prefix=$branch2: --color $branch1 $branch2 > $GIT_OUTPUT_FILE
+    _git diff --src-prefix=$branch1: --dst-prefix=$branch2: --color $branch1 $branch2 > $GIT_OUTPUT_FILE
     less -rf $GIT_OUTPUT_FILE
     rm -f $GIT_OUTPUT_FILE
 
-    git checkout "$CURRENT" >/dev/null 2>&1 ||
+    _git checkout "$CURRENT" >/dev/null 2>&1 ||
         die "Unable to switch back to $CURRENT"
 
-    git branch -D $branch1 $branch2 >/dev/null 2>&1 ||
+    _git branch -D $branch1 $branch2 >/dev/null 2>&1 ||
         die "Unable to delete temporary patch branches"
 }
 
@@ -465,7 +474,7 @@ reviewChange() {
     echo "You may supply a message. Hit return once your are done."
     read -e -p "Message: " MESSAGE
 
-    local CMD="$host $port gerrit review"
+    local CMD="$host -p $port gerrit review"
     CMD="$CMD --verified=$VERIFIED"
     CMD="$CMD --code-review=$CODE_REVIEW"
     CMD="$CMD --project=$project $CHANGE,$PATCH"
@@ -498,7 +507,7 @@ submitChange() {
     echo "You may supply a message. Hit return once your are done."
     read -e -p "Message: " MESSAGE
 
-    local CMD="$host $port gerrit review"
+    local CMD="$host -p $port gerrit review"
     CMD="$CMD --submit"
     CMD="$CMD --project=$project $CHANGE,$PATCH"
     if [[ -n $MESSAGE ]]; then
@@ -530,7 +539,7 @@ abandonChange() {
     echo "You may supply a message. Hit return once your are done."
     read -e -p "Message: " MESSAGE
 
-    local CMD="$host $port gerrit review"
+    local CMD="$host -p $port gerrit review"
     CMD="$CMD --abandon"
     CMD="$CMD --project=$project $CHANGE,$PATCH"
     if [[ -n $MESSAGE ]]; then
@@ -595,8 +604,8 @@ pushCommit() {
         #$GIT branch -f "$current.head"
         local msg="$($GIT log --pretty=format:'%s%n%b%n%n' $remote/$track..HEAD)"
 
-        $GIT reset --soft $remote/$track
-        $GIT commit -m "$msg"
+        _git reset --soft $remote/$track
+        _git commit -m "$msg"
     else
         # pull --rebase to make sure pushed commit bases on correct parent.
         local msg="Unable to pull and rebase your branch $track to the $remote/$track."
@@ -625,13 +634,13 @@ pushCommit() {
         change_args="$change_args/$topic"
     fi
 
-    git push $change_args ||
+    _git push $change_args ||
         die "Could not push your changes for review. Perhaps you need to update first?"
 
     git_push_output=$(test -f $GIT_OUTPUT_FILE && cat $GIT_OUTPUT_FILE)
 
     if [[ "$disable_reset_prompt" != "y" && -z "$change" && "$CURRENT" = "$track" ]] && ask_yes_no "Reset to $remote/$track?" "n"; then
-        git reset --hard $remote/$track ||
+        _git reset --hard $remote/$track ||
         die "Could not reset your $track branch to $remote/$track."
     fi
 
@@ -661,20 +670,31 @@ pushCommit() {
     fi
 }
 
-mergeBranch() {
-    git merge --squash "$1"
+squashChange() {
+    _git merge --squash "$1"
 
     if [ ! "$?" = 0 ] ; then
         die "You must type a exist branch or commit"
     fi
 
-    # find the commits.
-    if [ -e "${GIT_DIR}/SQUASH_MSG_" ] ; then
-        rm "${GIT_DIR}/SQUASH_MSG_"
+    change_id=$($GIT log --reverse $1 | grep Change-Id | head -n1)
+    if [ -z "$change_id" ]; then
+        echo "error: no Change-Id in these commits!"
+        exit 1
     fi
 
+    #XXXrobfield: unsafe tempfile creation, fix this.
+    commit_file="/tmp/squashChange.${change_id#Change-Id: }.$$"
+
+    $GIT log --reverse --pretty=format:'%B' $1 | grep -v Change-Id > $commit_file
+    echo >> $commit_file
+    echo "      $change_id" >> $commit_file
+    
+
+    # find the commits.
+    set -x
     head=$($GIT rev-parse HEAD)
-    commits=$(fgrep "commit " "${GIT_DIR}/SQUASH_MSG" | awk '{print $2}')
+    commits=$($FGREP "commit " "${GIT_DIR}/SQUASH_MSG" | awk '{print $2}')
     for commit in ${commits} ; do
         result=$($GIT cat-file commit $commit | grep "parent ${head}")
         if [ "" != "${result}" ] ; then
@@ -699,7 +719,47 @@ mergeBranch() {
 
     mv "${GIT_DIR}/SQUASH_MSG_" "${GIT_DIR}/SQUASH_MSG"
 
-    $GIT commit
+    _git commit
+}
+mergeBranch() {
+    _git merge --squash "$1"
+
+    if [ ! "$?" = 0 ] ; then
+        die "You must type a exist branch or commit"
+    fi
+
+    # find the commits.
+    if [ -e "${GIT_DIR}/SQUASH_MSG_" ] ; then
+        rm "${GIT_DIR}/SQUASH_MSG_"
+    fi
+    set -x
+    head=$($GIT rev-parse HEAD)
+    commits=$($FGREP "commit " "${GIT_DIR}/SQUASH_MSG" | awk '{print $2}')
+    for commit in ${commits} ; do
+        result=$($GIT cat-file commit $commit | grep "parent ${head}")
+        if [ "" != "${result}" ] ; then
+            break
+        fi
+    done
+
+    while read line ; do
+        result=$(echo ${line} | grep "commit ${commit}")
+        if [ "" != "${result}" ] ; then
+            break
+        fi
+
+        # ignore the Change-Id: line.
+        result=$(echo ${line} | grep "Change-Id:")
+        if [ "" != "${result}" ] ; then
+            continue
+        fi
+
+        echo ${line} >> "${GIT_DIR}/SQUASH_MSG_"
+    done < "${GIT_DIR}/SQUASH_MSG"
+
+    mv "${GIT_DIR}/SQUASH_MSG_" "${GIT_DIR}/SQUASH_MSG"
+
+    _git commit
 }
 
 abort_on_bad_repo_state() {
@@ -709,6 +769,8 @@ abort_on_bad_repo_state() {
 }
 
 initGerrit() {
+
+
     local commit_hook="${GIT_DIR}/hooks/commit-msg"
 
     if [ -x "${commit_hook}" ] ; then
@@ -717,9 +779,9 @@ initGerrit() {
     fi
 
     getGerritServerAndProject
-    scp $port $host:hooks/commit-msg "${commit_hook}" || die "failed to add gerrit commit-msg hook."
-    chmod +x "${commit_hook}"
-    echo "gerrit commit-msg hook setup correctly."
+    scp -P $port $host:hooks/commit-msg "${commit_hook}" || die "failed to add gerrit commit-msg hook."
+    chmod +x "${commit_hook}"/*
+    echo "gerrit hooks setup correctly."
 }
 
 openChange() {
@@ -913,6 +975,10 @@ while true; do
             ;;
         -h | --help | help)
             printUsage
+            exit
+            ;;
+        squashchange)
+            squashChange $1
             exit
             ;;
         merge)
